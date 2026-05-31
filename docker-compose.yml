@@ -1,0 +1,247 @@
+networks:
+  multinorm-net:
+    driver: bridge
+
+volumes:
+  pip-cache:
+  ray-temp:
+  hf-cache:
+  docling-cache:
+  ollama-cache:
+  grafana-data:
+  milvus-data:
+  milvus-wal:
+  milvus-dml:
+  minio-data:
+  etcd-data:
+
+services:
+  # -----------------------------
+  # Multinorm (включает API)
+  # -----------------------------
+  multinorm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multinorm
+    user: root
+    runtime: nvidia
+    networks:
+      - multinorm-net
+    environment:
+      - RAY_TMPDIR=/tmp/ray_worker
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
+      - PYTHONUNBUFFERED=1
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/app/code
+      - OLLAMA_URL_0=http://ollama-0:11434
+      - OLLAMA_URL_1=http://ollama-1:11435
+    volumes:
+      - ./app/code:/app/code
+      - ./app/data:/app/data
+      - ./app/models:/app/models
+      - pip-cache:/root/.cache/pip
+      - ray-temp:/tmp/ray_worker
+      - hf-cache:/root/.cache/huggingface
+      - docling-cache:/root/.cache/docling
+    ports:
+      - "5081:8000"
+    tty: true
+    stdin_open: true
+    depends_on:
+      - milvus
+      - ray-head
+      - ray-worker
+      - ollama-0
+      - ollama-1
+    shm_size: '5gb'
+    command: bash -c "uvicorn code.api.main:app --host 0.0.0.0 --port 8000 & exec bash"
+
+  # -----------------------------
+  # Milvus stack
+  # -----------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: milvus-etcd-mn
+    networks:
+      - multinorm-net
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: >
+      etcd
+      -advertise-client-urls=http://etcd:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - etcd-data:/etcd
+    ports:
+      - "2379:2379"
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: milvus-minio-mn
+    networks:
+      - multinorm-net
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio-data:/minio_data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  milvus:
+    image: milvusdb/milvus:v2.6.7-gpu
+    container_name: milvus-mn
+    command: ["milvus", "run", "standalone"]
+    networks:
+      - multinorm-net
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    shm_size: '5gb'
+    volumes:
+      - milvus-data:/var/lib/milvus/db
+      - milvus-wal:/var/lib/milvus/wal
+      - milvus-dml:/var/lib/milvus/dml
+
+  # -----------------------------
+  # Ray
+  # -----------------------------
+  ray-head:
+    image: multinorm-multinorm:latest
+    container_name: ray-head
+    user: root
+    hostname: ray-head
+    volumes:
+      - ./app/data:/app/data:ro
+      - type: volume
+        source: pip-cache
+        target: /usr/local/bin/py-spy
+        read_only: true
+    networks:
+      - multinorm-net
+    environment:
+      - RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+      - RAY_PROMETHEUS_ENABLED=true
+      - RAY_HEAD_ONLY=false
+      - RAY_GRAFANA_HOST=http://grafana:3000
+      - RAY_GRAFANA_ORG_ID=1
+      - RAY_GRAFANA_DASHBOARD_ID=rayDefaultDashboard
+      - RAY_GRAFANA_IFRAME_HOST=http://localhost:3000
+      - RAY_PROMETHEUS_HOST=http://prometheus:9090
+      - RAY_PROMETHEUS_NAME=Prometheus
+    command: sh -c "ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --metrics-export-port=8080; exec tail -f /dev/null"
+    ports:
+      - "6379:6379"
+      - "8265:8265"
+      - "10001:10001"
+      - "8080:8080"
+    shm_size: '5gb'
+
+  ray-worker:
+    image: multinorm-multinorm:latest
+    container_name: ray-worker
+    runtime: nvidia
+    user: root
+    volumes:
+      - ./app/code:/app/code      # ← добавить
+      - ./app/data:/app/data
+      - ./app/models:/app/models  # ← добавить (нужно для моделей)
+    networks:
+      - multinorm-net
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/app      # ← добавить
+    command: sh -c "ray start --address=ray-head:6379 --metrics-export-port=8081; exec tail -f /dev/null"
+    ports:
+      - "8081:8081"
+    shm_size: '5gb'
+    depends_on:
+      - ray-head
+
+  # -----------------------------
+  # Ollama 0 — GPU 0
+  # -----------------------------
+  ollama-0:
+    image: ollama/ollama:latest
+    container_name: ollama-0
+    runtime: nvidia
+    networks:
+      - multinorm-net
+    volumes:
+      - ollama-cache:/root/.ollama
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    ports:
+      - "11434:11434"
+    entrypoint: ["ollama", "serve"]
+
+  # -----------------------------
+  # Ollama 1 — GPU 1
+  # -----------------------------
+  ollama-1:
+    image: ollama/ollama:latest
+    container_name: ollama-1
+    runtime: nvidia
+    networks:
+      - multinorm-net
+    volumes:
+      - ollama-cache:/root/.ollama
+    environment:
+      - CUDA_VISIBLE_DEVICES=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    ports:
+      - "11435:11434"
+    entrypoint: ["ollama", "serve"]
+
+  # -----------------------------
+  # Мониторинг
+  # -----------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    networks:
+      - multinorm-net
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks:
+      - multinorm-net
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_SECURITY_COOKIE_SAMESITE=none
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_PROVISIONING_PATH=/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
